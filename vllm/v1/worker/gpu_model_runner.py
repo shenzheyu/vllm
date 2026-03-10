@@ -176,6 +176,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.worker.routed_experts_exporter import RoutedExpertsFileExporter
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
     check_ubatch_thresholds,
@@ -753,6 +754,7 @@ class GPUModelRunner(
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
+        self.routed_experts_exporter: RoutedExpertsFileExporter | None = None
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
         self.layerwise_nvtx_hooks_registered = False
@@ -3376,7 +3378,6 @@ class GPUModelRunner(
             return slot_mappings_by_gid, result
 
         return slot_mappings_by_gid, slot_mappings_by_layer
-
     @torch.inference_mode()
     def execute_model(
         self,
@@ -3395,6 +3396,8 @@ class GPUModelRunner(
                 capturer.clear_buffer()  # noqa
             else:
                 logger.error("RoutedExpertsCapturer not initialized.")
+        if self.routed_experts_exporter is not None:
+            self.routed_experts_exporter.clear_buffer()
 
         if scheduler_output.preempted_req_ids and has_kv_transfer_group():
             get_kv_transfer_group().handle_preemptions(
@@ -3860,6 +3863,13 @@ class GPUModelRunner(
                     capturer.save_captured_experts(indices=self.slot_mapping)  # noqa
                 else:
                     logger.error("RoutedExpertsCapturer not initialized.")
+            if self.routed_experts_exporter is not None:
+                self._export_prefill_routed_experts_batch(scheduler_output)
+            elif RoutedExpertsFileExporter.create_from_env() is not None:
+                raise RuntimeError(
+                    "Routed experts exporter environment detected but exporter "
+                    "was not initialized on the worker."
+                )
 
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
@@ -6098,6 +6108,7 @@ class GPUModelRunner(
 
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
+        self.init_routed_experts_exporter()
 
     def init_routed_experts_capturer(self):
         logger.info(
@@ -6131,6 +6142,69 @@ class GPUModelRunner(
                     _capturer.capture(_layer_id, topk_ids)
 
                 module.router.set_capture_fn(_capture_fn)
+
+    def init_routed_experts_exporter(self) -> None:
+        if self.model_config.enable_return_routed_experts:
+            return
+        exporter = RoutedExpertsFileExporter.create_from_env()
+        if exporter is None:
+            return
+
+        exporter.init_buffer(
+            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+            vllm_config=self.vllm_config,
+        )
+        self._bind_routed_experts_exporter(exporter)
+        self.routed_experts_exporter = exporter
+
+    def _bind_routed_experts_exporter(
+        self, exporter: RoutedExpertsFileExporter
+    ) -> None:
+        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+        from vllm.model_executor.layers.fused_moe.router.base_router import (
+            BaseRouter,
+        )
+
+        for module in self.compilation_config.static_forward_context.values():
+            if isinstance(module, FusedMoE) and isinstance(module.router, BaseRouter):
+                layer_id = module.layer_id
+
+                def _capture_fn(topk_ids, _layer_id=layer_id, _exporter=exporter):
+                    _exporter.capture(_layer_id, topk_ids)
+
+                module.router.set_capture_fn(_capture_fn)
+
+    def _export_prefill_routed_experts_batch(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> None:
+        assert self.routed_experts_exporter is not None
+
+        scheduled_req_ids = set(scheduler_output.num_scheduled_tokens)
+        if not scheduled_req_ids:
+            return
+
+        num_reqs = len(scheduler_output.num_scheduled_tokens)
+        token_ranges: list[tuple[str, int, int]] = []
+        seen_req_ids: set[str] = set()
+        for req_pos, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+            if req_id is None or req_id not in scheduled_req_ids:
+                continue
+            start = int(self.query_start_loc.np[req_pos])
+            end = int(self.query_start_loc.np[req_pos + 1])
+            if end <= start:
+                continue
+            token_ranges.append((req_id, start, end))
+            seen_req_ids.add(req_id)
+
+        missing_req_ids = scheduled_req_ids - seen_req_ids
+        if missing_req_ids:
+            missing = ", ".join(sorted(missing_req_ids))
+            raise RuntimeError(
+                "Missing scheduled request ranges for routed experts export: "
+                f"{missing}."
+            )
+
+        self.routed_experts_exporter.export_batch(token_ranges)
 
     def may_add_encoder_only_layers_to_kv_cache_config(self) -> None:
         """

@@ -158,3 +158,92 @@ def test_gpu_model_runner_binding_stage(monkeypatch):
     assert callable(dummy_module.router.capture_fn)
     dummy_module.router.capture_fn(torch.tensor([[9, 10]]))
     assert len(capturer.calls) == 1
+
+
+def test_gpu_model_runner_binds_router_exporter(monkeypatch):
+    from vllm.v1.worker import gpu_model_runner as gmr
+
+    class DummyFusedMoE:
+        def __init__(self):
+            self.layer_id = 13
+            self.router = _make_router()
+
+    class DummyExporter:
+        def __init__(self):
+            self.calls = []
+
+        def capture(self, layer_id, topk_ids):
+            self.calls.append((layer_id, topk_ids))
+
+    dummy_module = DummyFusedMoE()
+
+    import vllm.model_executor.layers.fused_moe.layer as fused_moe_layer
+
+    monkeypatch.setattr(fused_moe_layer, "FusedMoE", DummyFusedMoE)
+
+    dummy_self = types.SimpleNamespace(
+        compilation_config=types.SimpleNamespace(
+            static_forward_context={"dummy": dummy_module}
+        )
+    )
+
+    exporter = DummyExporter()
+    gmr.GPUModelRunner._bind_routed_experts_exporter(dummy_self, exporter)
+
+    assert callable(dummy_module.router.capture_fn)
+    dummy_module.router.capture_fn(torch.tensor([[7, 8]]))
+
+    assert len(exporter.calls) == 1
+    layer_id, topk_ids = exporter.calls[0]
+    assert layer_id == 13
+    assert torch.equal(topk_ids, torch.tensor([[7, 8]]))
+
+
+def test_routed_experts_file_exporter_writes_request_records(tmp_path):
+    from vllm.v1.worker.routed_experts_exporter import RoutedExpertsFileExporter
+
+    exporter = RoutedExpertsFileExporter(tmp_path)
+    exporter._device_buffer = torch.tensor(
+        [
+            [[1, 2], [3, 4]],
+            [[5, 6], [7, 8]],
+            [[9, 10], [11, 12]],
+        ],
+        dtype=torch.int32,
+    )
+    exporter._writer_enabled = True
+
+    output_path = exporter.export_batch(
+        [
+            ("0-acde", 0, 2),
+            ("1-bcde", 2, 3),
+        ]
+    )
+
+    assert output_path is not None
+    payload = torch.load(output_path, map_location="cpu", weights_only=False)
+    assert payload["metadata"]["batch_index"] == 0
+    assert [record["request_id"] for record in payload["records"]] == ["0", "1"]
+    assert [record["worker_request_id"] for record in payload["records"]] == [
+        "0-acde",
+        "1-bcde",
+    ]
+    assert torch.equal(
+        payload["records"][0]["routed_experts"],
+        torch.tensor(
+            [
+                [[1, 2], [3, 4]],
+                [[5, 6], [7, 8]],
+            ],
+            dtype=torch.int32,
+        ),
+    )
+    assert torch.equal(
+        payload["records"][1]["routed_experts"],
+        torch.tensor(
+            [
+                [[9, 10], [11, 12]],
+            ],
+            dtype=torch.int32,
+        ),
+    )

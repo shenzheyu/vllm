@@ -23,6 +23,7 @@ from vllm.config import VllmConfig
 from vllm.envs import VLLM_ENGINE_READY_TIMEOUT_S
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
+from vllm.sem_moe import make_sem_moe_dp_selector
 from vllm.tasks import SupportedTask
 from vllm.tracing import instrument
 from vllm.utils.async_utils import in_loop
@@ -1357,27 +1358,47 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         self.eng_start_index = (
             len(self.core_engines) * self.client_index
         ) // client_count
+        self.sem_moe_dp_selector = None
+        self._sem_moe_selector_num_engines = 0
+
+    def _refresh_sem_moe_dp_selector(self) -> None:
+        num_engines = len(self.core_engines)
+        if self._sem_moe_selector_num_engines == num_engines:
+            return
+        if getattr(self.vllm_config.model_config, "quantization", None) is not None:
+            self.sem_moe_dp_selector = None
+            self._sem_moe_selector_num_engines = num_engines
+            return
+        self.sem_moe_dp_selector = make_sem_moe_dp_selector(num_engines)
+        self._sem_moe_selector_num_engines = num_engines
 
     def get_core_engine_for_request(self, request: EngineCoreRequest) -> EngineIdentity:
         # Engines are in rank order.
         if (eng_index := request.data_parallel_rank) is None:
-            current_counts = self.lb_engines
-            # TODO use P2C alg for larger DP sizes
-            num_engines = len(current_counts)
-            min_score = sys.maxsize
-            eng_index = 0
-            for i in range(num_engines):
-                # Start from client_index to help with balancing when engines
-                # are empty.
-                idx = (self.eng_start_index + i) % num_engines
-                waiting, running = current_counts[idx]
-                score = waiting * 4 + running
-                if score < min_score:
-                    min_score = score
-                    eng_index = idx
-            # Increment local waiting count for better balancing between stats
-            # updates from the coordinator (which happen every 100ms).
-            current_counts[eng_index][0] += self.client_count
+            self._refresh_sem_moe_dp_selector()
+            if (
+                self.sem_moe_dp_selector is not None
+                and request.prompt_token_ids is not None
+            ):
+                eng_index = self.sem_moe_dp_selector.pick_rank(request.prompt_token_ids)
+            else:
+                current_counts = self.lb_engines
+                # TODO use P2C alg for larger DP sizes
+                num_engines = len(current_counts)
+                min_score = sys.maxsize
+                eng_index = 0
+                for i in range(num_engines):
+                    # Start from client_index to help with balancing when engines
+                    # are empty.
+                    idx = (self.eng_start_index + i) % num_engines
+                    waiting, running = current_counts[idx]
+                    score = waiting * 4 + running
+                    if score < min_score:
+                        min_score = score
+                        eng_index = idx
+                # Increment local waiting count for better balancing between stats
+                # updates from the coordinator (which happen every 100ms).
+                current_counts[eng_index][0] += self.client_count
 
         chosen_engine = self.core_engines[eng_index]
         # Record which engine is chosen for this request, to handle aborts.

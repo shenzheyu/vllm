@@ -452,6 +452,8 @@ class FusedMoE(CustomOp):
             self.local_num_experts = local_num_experts
             self.register_buffer("_expert_map", expert_map)
             self.register_buffer("expert_mask", expert_mask)
+            self.register_buffer("_sem_moe_loader_expert_map", None)
+            self.register_buffer("_sem_moe_runtime_expert_map", None)
             self._maybe_init_expert_routing_tables()
             logger.info_once(
                 "[EP Rank %s/%s] Expert parallelism is enabled. Expert "
@@ -832,14 +834,58 @@ class FusedMoE(CustomOp):
                 return_expert_mask=self.rocm_aiter_fmoe_enabled,
             )
             self.local_num_experts = local_num_experts
-            self.register_buffer("_expert_map", expert_map)
-            self.register_buffer("expert_mask", expert_mask)
+            self._set_expert_map_buffers(expert_map, expert_mask)
             self._maybe_init_expert_routing_tables()
             if self.aiter_fmoe_shared_expert_enabled:
                 self._init_aiter_shared_experts_topK_buffer(
                     vllm_config=get_current_vllm_config(),
                     dp_size=get_dp_group().world_size,
                 )
+
+    def install_sem_moe_loader_map(
+        self,
+        loader_map: torch.Tensor,
+        runtime_map: torch.Tensor,
+    ) -> None:
+        if self._expert_map is None:
+            raise ValueError("Sem-MoE expert placement requires EP-enabled FusedMoE.")
+        if loader_map.shape != self._expert_map.shape:
+            raise ValueError(
+                f"Sem-MoE loader_map shape {tuple(loader_map.shape)} does not match "
+                f"expert_map shape {tuple(self._expert_map.shape)}."
+            )
+        if runtime_map.shape != self._expert_map.shape:
+            raise ValueError(
+                f"Sem-MoE runtime_map shape {tuple(runtime_map.shape)} does not match "
+                f"expert_map shape {tuple(self._expert_map.shape)}."
+            )
+
+        device = self._expert_map.device
+        loader_map = loader_map.to(device=device, dtype=torch.int32)
+        runtime_map = runtime_map.to(device=device, dtype=torch.int32)
+        self._buffers["_sem_moe_loader_expert_map"] = loader_map
+        self._buffers["_sem_moe_runtime_expert_map"] = runtime_map
+        self._set_expert_map_buffers(loader_map, self.expert_mask)
+
+    def activate_sem_moe_runtime_map(self) -> None:
+        runtime_map = self._sem_moe_runtime_expert_map
+        if runtime_map is None:
+            return
+        self._set_expert_map_buffers(runtime_map, self.expert_mask)
+        self._maybe_init_expert_routing_tables()
+        if self.aiter_fmoe_shared_expert_enabled:
+            self._init_aiter_shared_experts_topK_buffer(
+                vllm_config=get_current_vllm_config(),
+                dp_size=get_dp_group().world_size,
+            )
+
+    def _set_expert_map_buffers(
+        self,
+        expert_map: torch.Tensor | None,
+        expert_mask: torch.Tensor | None,
+    ) -> None:
+        self._buffers["_expert_map"] = expert_map
+        self._buffers["expert_mask"] = expert_mask
 
     def _load_per_tensor_weight_scale(
         self,

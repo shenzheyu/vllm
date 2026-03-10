@@ -14,6 +14,7 @@ from vllm.model_executor.model_loader.utils import (
     process_weights_after_loading,
 )
 from vllm.platforms import current_platform
+from vllm.sem_moe import bind_sem_moe_model_for_loading, finalize_sem_moe_model
 from vllm.tracing import instrument
 from vllm.utils.mem_utils import format_gib
 from vllm.utils.torch_utils import set_default_torch_dtype
@@ -56,6 +57,7 @@ class BaseModelLoader(ABC):
                 )
 
             log_model_inspection(model)
+            bind_sem_moe_model_for_loading(model, model_config)
 
             logger.debug("Loading weights on %s ...", load_device)
             # Quantization does not happen in `load_weights` but after it
@@ -72,6 +74,7 @@ class BaseModelLoader(ABC):
                 )
 
             process_weights_after_loading(model, model_config, target_device)
+            finalize_sem_moe_model(model)
 
         return model.eval()
 
