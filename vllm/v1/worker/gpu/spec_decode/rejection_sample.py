@@ -48,17 +48,8 @@ def rejection_sample(
     num_speculative_steps: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_reqs = cu_num_logits.shape[0] - 1
-    sampled = torch.empty(
-        num_reqs,
-        num_speculative_steps + 1,
-        dtype=target_sampled.dtype,
-        device=target_sampled.device,
-    )
-    num_sampled = torch.empty(
-        num_reqs,
-        dtype=torch.int32,
-        device=target_sampled.device,
-    )
+    sampled = target_sampled.new_empty(num_reqs, num_speculative_steps + 1)
+    num_sampled = cu_num_logits.new_empty(num_reqs)
     _rejection_sample_kernel[(num_reqs,)](
         sampled,
         sampled.stride(0),
@@ -69,15 +60,3 @@ def rejection_sample(
         num_warps=1,
     )
     return sampled, num_sampled
-
-
-@torch.compile(dynamic=True)
-def get_num_rejected(
-    cu_num_logits: torch.Tensor,
-    num_sampled: torch.Tensor,
-) -> torch.Tensor:
-    num_logits = cu_num_logits[1:] - cu_num_logits[:-1]
-    num_rejected = num_logits - num_sampled
-    # No token is rejected for chunked prefills.
-    num_rejected *= num_sampled > 0
-    return num_rejected

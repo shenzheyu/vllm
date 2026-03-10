@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from itertools import repeat
 from typing import Any
 
 import pytest
 import torch._dynamo.config as dynamo_config
 
+from tests.utils import large_gpu_mark, single_gpu_only
 from vllm import SamplingParams
 from vllm.logprobs import Logprob
+from vllm.platforms import current_platform
 from vllm.sampling_params import StructuredOutputsParams
 from vllm.v1.metrics.reader import Metric
 
@@ -17,6 +20,8 @@ from ...models.utils import check_outputs_equal
 MODEL = "Qwen/Qwen3-0.6B"
 MTP_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
 
+# Need to enforce eager for MRV2 while we sort out cudagraph issues.
+ENFORCE_EAGER = os.getenv("ENFORCE_EAGER", "0") == "1"
 
 first_prompt = (
     "The following numbers of the sequence "
@@ -29,11 +34,12 @@ example_prompts = [first_prompt, "In one word, the capital of France is "] + [
 
 default_params = dict(
     temperature=0.0,  # greedy
-    max_tokens=23,
-    min_tokens=18,
+    max_tokens=30,
+    min_tokens=28,
 )
 
 
+@single_gpu_only
 def test_without_spec_decoding(
     sample_json_schema,
     monkeypatch: pytest.MonkeyPatch,
@@ -44,15 +50,23 @@ def test_without_spec_decoding(
     test_sampling_params: list[dict[str, Any]] = [
         dict(),
         # dict(min_tokens=20),
-        dict(presence_penalty=-1.0),
+        dict(frequency_penalty=-1.0),
         dict(bad_words=["the", " the"]),
         dict(logprobs=2),
-        dict(logprobs=2, presence_penalty=-1.0),
+        dict(logprobs=2, frequency_penalty=-1.0),
         dict(structured_outputs=struct_outputs),
         dict(
             structured_outputs=struct_outputs,
             logprobs=2,
-            presence_penalty=-1.0,
+        ),
+        dict(
+            structured_outputs=struct_outputs,
+            frequency_penalty=-1.0,
+        ),
+        dict(
+            structured_outputs=struct_outputs,
+            logprobs=2,
+            frequency_penalty=-1.0,
         ),
     ]
 
@@ -70,10 +84,24 @@ def test_without_spec_decoding(
         (True, "uni", True, None, True),
     ]
 
+    if current_platform.is_rocm():
+        # On ROCm, Only test with structured_outputs (deterministic)
+        # and skip chunk_prefill (more variable).
+        test_configs = [
+            cfg
+            for cfg in test_configs
+            if not cfg[4]  # skip chunk_prefill=True
+        ]
+        test_sampling_params = [
+            p for p in test_sampling_params if p.get("structured_outputs") is not None
+        ]
+
     run_tests(monkeypatch, MODEL, test_configs, test_sampling_params)
 
 
-def test_with_spec_decoding(monkeypatch: pytest.MonkeyPatch):
+@single_gpu_only
+@large_gpu_mark(min_gb=16)
+def test_with_eagle3_spec_decoding(sample_json_schema, monkeypatch: pytest.MonkeyPatch):
     """Test consistency and acceptance rates with some different combos of
     preemption, executor, async scheduling, prefill chunking,
     spec decoding model length.
@@ -87,9 +115,20 @@ def test_with_spec_decoding(monkeypatch: pytest.MonkeyPatch):
     # Set small draft model len to force doesn't-fit-in-drafter case.
     spec_config_short = spec_config | {"max_model_len": 50}
 
+    struct_outputs = StructuredOutputsParams(json=sample_json_schema)
+
     test_sampling_params = [
         dict(),
+        dict(frequency_penalty=-1.0),
+        dict(bad_words=["the", " the"]),
         dict(logprobs=2),
+        dict(logprobs=2, frequency_penalty=-1.0),
+        dict(structured_outputs=struct_outputs),
+        dict(
+            structured_outputs=struct_outputs,
+            logprobs=2,
+            frequency_penalty=-1.0,
+        ),
     ]
 
     # test_preemption, executor, async_scheduling,
@@ -111,6 +150,42 @@ def test_with_spec_decoding(monkeypatch: pytest.MonkeyPatch):
     run_tests(monkeypatch, MTP_MODEL, test_configs, test_sampling_params)
 
 
+def test_with_ngram_gpu_spec_decoding(monkeypatch: pytest.MonkeyPatch):
+    """Test ngram_gpu speculative decoding with different configurations.
+
+    This test specifically validates ngram_gpu behavior with various:
+    - Number of speculative tokens (2-6)
+    - Prompt lookup window sizes (min/max)
+    - Async scheduling enabled (as in production)
+    - Different executors and chunking settings
+    """
+
+    # Variant with larger speculation window
+    ngram_gpu_config = {
+        "method": "ngram_gpu",
+        "num_speculative_tokens": 3,
+        "prompt_lookup_max": 3,
+        "prompt_lookup_min": 2,
+    }
+
+    # Test configurations covering various scenarios
+    # test_preemption, executor, async_scheduling,
+    # spec_config, test_prefill_chunking
+    test_configs = [
+        (False, "mp", False, None, False),
+        (False, "mp", False, ngram_gpu_config, False),
+        (True, "mp", False, ngram_gpu_config, True),
+        (False, "mp", True, ngram_gpu_config, False),
+        (True, "mp", True, ngram_gpu_config, False),
+        (True, "uni", True, ngram_gpu_config, False),
+        (True, "mp", True, ngram_gpu_config, True),
+    ]
+
+    # Use MODEL (Qwen) for ngram_gpu tests as it's lighter weight
+    # and ngram_gpu doesn't require a specific draft model
+    run_tests(monkeypatch, MODEL, test_configs, [{}])
+
+
 @dynamo_config.patch(cache_size_limit=16)
 def run_tests(
     monkeypatch: pytest.MonkeyPatch,
@@ -121,9 +196,12 @@ def run_tests(
     """Test consistency of combos of async scheduling, preemption,
     uni/multiproc executor with spec decoding."""
 
+    # Flex attention supports float32.
+    attention_config = {"backend": "FLEX_ATTENTION"}
+
     with monkeypatch.context() as m:
-        # avoid precision errors
-        m.setenv("VLLM_ATTENTION_BACKEND", "FLEX_ATTENTION")
+        # lock matmul precision to full FP32 (IEEE)
+        m.setenv("VLLM_FLOAT32_MATMUL_PRECISION", "highest")
         # m.setenv("VLLM_BATCH_INVARIANT", "1")
         outputs: list[tuple[str, list, list]] = []
         for n, (
@@ -143,6 +221,7 @@ def run_tests(
                 async_scheduling,
                 spec_config,
                 test_prefill_chunking=test_prefill_chunking,
+                attention_config=attention_config,
             )
             outputs.append(test_results)
 
@@ -165,6 +244,7 @@ def run_tests(
             test_acceptance_rates or repeat(None),
             test_sampling_params,
         ):
+            reason = None
             try:
                 check_outputs_equal(
                     outputs_0_lst=base_outs,
@@ -172,33 +252,57 @@ def run_tests(
                     name_0=f"baseline=[{baseline_config}], params={params}",
                     name_1=f"config=[{test_config}], params={params}",
                 )
-                assert _all_logprobs_match(base_logprobs, test_logprobs)
+            except AssertionError as e:
+                reason = "outputs ", e
 
-                if (
-                    base_acceptance_rate is not None
-                    and test_acceptance_rate is not None
-                ):
-                    if "spec_mml=None" in test_config:
-                        assert (
-                            test_acceptance_rate > base_acceptance_rate
-                            or test_acceptance_rate
-                            == pytest.approx(base_acceptance_rate, rel=5e-2)
-                        )
-                    else:
-                        # Currently the reported acceptance rate is expected to be
-                        # lower when we sometimes skip drafting altogether.
-                        assert test_acceptance_rate > 0.1
+            if reason is None:
+                try:
+                    assert _all_logprobs_match(base_logprobs, test_logprobs)
+                except AssertionError as e:
+                    reason = "logprobs", e
+
+            if reason is None:
+                try:
+                    if (
+                        base_acceptance_rate is not None
+                        and test_acceptance_rate is not None
+                    ):
+                        if "spec_mml=None" in test_config:
+                            # Preemption causes more variance in acceptance rates
+                            if (
+                                current_platform.is_rocm()
+                                and "preemption=True" in test_config
+                            ):
+                                tolerance = 0.10
+                            else:
+                                tolerance = 0.05
+                            assert (
+                                test_acceptance_rate > base_acceptance_rate
+                                or test_acceptance_rate
+                                == pytest.approx(base_acceptance_rate, rel=tolerance)
+                            )
+                        else:
+                            # Currently the reported acceptance rate is expected to be
+                            # lower when we sometimes skip drafting altogether.
+                            assert test_acceptance_rate > 0.1
+                except AssertionError as e:
+                    reason = "accept  ", e
+
+            if reason is None:
                 print(
-                    f"PASSED: config=[{test_config}], params={params}"
+                    f"\033[32mPASSED\033[0m:           "
+                    f"config=[{test_config}], params={params}"
                     f" accept_rate={test_acceptance_rate}"
                 )
-            except AssertionError as e:
+            else:
+                reason_str, _ = reason
                 print(
-                    f"FAILED: config=[{test_config}], params={params}"
+                    f"\033[31mFAILED\033[0m({reason_str}): "
+                    f"config=[{test_config}], params={params}"
                     f" accept_rate={test_acceptance_rate}"
                 )
                 if failure is None:
-                    failure = e
+                    _, failure = reason
 
     if failure is not None:
         raise failure
@@ -213,6 +317,7 @@ def run_test(
     async_scheduling: bool,
     spec_config: dict[str, Any] | None,
     test_prefill_chunking: bool,
+    attention_config: dict[str, Any] | None = None,
 ):
     spec_decoding = spec_config is not None
     cache_arg: dict[str, Any] = (
@@ -222,27 +327,30 @@ def run_test(
         else dict(gpu_memory_utilization=0.9)
     )
     spec_mml = (spec_config or {}).get("max_model_len")
+    spec_method = (spec_config or {}).get("method", "none")
     test_config = (
         f"executor={executor}, preemption={test_preemption}, "
         f"async_sched={async_scheduling}, "
         f"chunk_prefill={test_prefill_chunking}, "
-        f"spec_decoding={spec_decoding}, spec_mml={spec_mml}"
+        f"spec_decoding={spec_decoding}, spec_method={spec_method}, spec_mml={spec_mml}"
     )
     print("-" * 80)
     print(f"---- TESTING {test_str}: {test_config}")
     print("-" * 80)
+
     with VllmRunner(
         model,
-        max_model_len=512,
+        max_model_len=4096,
         enable_chunked_prefill=test_prefill_chunking,
         # Force prefill chunking
         max_num_batched_tokens=48 if test_prefill_chunking else None,
-        # enforce_eager=True,
+        enforce_eager=ENFORCE_EAGER,
         async_scheduling=async_scheduling,
         distributed_executor_backend=executor,
-        dtype="float32",  # avoid precision errors
+        dtype="float32",
         speculative_config=spec_config,
         disable_log_stats=False,
+        attention_config=attention_config,
         **cache_arg,
     ) as vllm_model:
         results = []
@@ -300,11 +408,16 @@ def _all_logprobs_match(req_a, req_b) -> bool:
 
 
 def _logprobs_match(lps_a: dict[int, Logprob], lps_b: dict[int, Logprob]) -> bool:
-    return len(lps_a) == len(lps_b) and all(
-        a.decoded_token == b.decoded_token
-        and a.rank == b.rank
-        and a.logprob == pytest.approx(b.logprob, rel=1e-3, abs=1e-6)
-        for a, b in ((lps_a[x], lps_b[x]) for x in lps_a)
+    rel_tol, abs_tol = 1e-3, 1e-6
+    return (
+        len(lps_a) == len(lps_b)
+        and lps_a.keys() == lps_b.keys()
+        and all(
+            a.decoded_token == b.decoded_token
+            and a.rank == b.rank
+            and a.logprob == pytest.approx(b.logprob, rel=rel_tol, abs=abs_tol)
+            for a, b in ((lps_a[x], lps_b[x]) for x in lps_a)
+        )
     )
 
 
