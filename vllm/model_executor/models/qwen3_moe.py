@@ -81,8 +81,7 @@ from .utils import (
 
 logger = init_logger(__name__)
 
-# Minimum tokens to apply Sem-MoE TP rebatching
-_SEM_MOE_MIN_REBATCH_TOKENS = 16
+# Imported from sem_moe_tp at use site to avoid circular imports at module level
 
 
 class Qwen3MoeMLP(nn.Module):
@@ -242,12 +241,15 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         if (
             self._sem_moe_tp_ctx is not None
             and not self._sem_moe_srs_active
-            and num_tokens >= _SEM_MOE_MIN_REBATCH_TOKENS
         ):
-            from vllm.sem_moe_tp import rebatch_for_layer
+            from vllm.sem_moe_tp import _MIN_REBATCH_TOKENS, rebatch_for_layer
             fwd_ctx = get_forward_context()
             input_ids = fwd_ctx.additional_kwargs.get("sem_moe_input_ids")
-            if input_ids is not None and input_ids.shape[0] >= num_tokens:
+            if (
+                num_tokens >= _MIN_REBATCH_TOKENS
+                and input_ids is not None
+                and input_ids.shape[0] >= num_tokens
+            ):
                 hidden_states, shf_idx, inv_shf, chunk_size = rebatch_for_layer(
                     self._sem_moe_tp_ctx,
                     self.layer_idx,
@@ -498,7 +500,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         Only called when _sem_moe_srs_active=True, which is only set when
         all2all is available in fused_moe (checked at finalize time).
         """
-        from vllm.sem_moe_tp import rebatch_for_layer
+        from vllm.sem_moe_tp import _MIN_REBATCH_TOKENS, rebatch_for_layer
         from vllm.sem_moe_triton import sag_or_fallback, srs_or_fallback
 
         ctx = self._sem_moe_tp_ctx
@@ -512,7 +514,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         moe_layer_idx = getattr(self.mlp, "layer_idx", None)
         can_rebatch = (
             input_ids is not None
-            and num_tokens >= _SEM_MOE_MIN_REBATCH_TOKENS
+            and num_tokens >= _MIN_REBATCH_TOKENS
             and moe_layer_idx is not None
         )
 
@@ -532,7 +534,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
             return hidden_states, residual
 
         _, shf_idx, inv_shf, chunk_size = rebatch_for_layer(
-            ctx, moe_layer_idx, input_ids[:num_tokens], hidden_states
+            ctx, moe_layer_idx, input_ids[:num_tokens], hidden_states,
+            indices_only=True,
         )
 
         # Pad hidden_states and residual to match shf_idx length (N_padded)
@@ -560,12 +563,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
 
         # MoE: check if fused_moe has native all2all dispatch/combine.
-        experts = getattr(self.mlp, "experts", None)
-        has_native_all2all = (
-            experts is not None
-            and hasattr(experts, "moe_parallel_config")
-            and experts.moe_parallel_config.use_all2all_kernels
-        )
+        # Pre-computed at finalize time to avoid getattr chain every forward.
+        has_native_all2all = getattr(self, "_sem_moe_has_native_all2all", False)
         if has_native_all2all:
             hidden_states = self.mlp(hidden_states)
         else:

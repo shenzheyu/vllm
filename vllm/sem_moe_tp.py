@@ -143,6 +143,7 @@ def rebatch_for_layer(
     layer_id: int,
     input_ids: torch.Tensor,
     hidden_states: torch.Tensor,
+    indices_only: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """Compute shuffle indices for TP token rebatching (Algorithm 3).
 
@@ -157,10 +158,13 @@ def rebatch_for_layer(
         layer_id: current MoE layer id
         input_ids: [num_tokens] int64
         hidden_states: [num_tokens, hidden_dim]
+        indices_only: if True, skip hidden_states shuffle (SRS path computes
+            it separately). First return value will be the un-shuffled
+            hidden_states (possibly padded).
 
     Returns:
         (hidden_states_shuffled, shf_idx, inv_shf, chunk_size)
-        - hidden_states_shuffled: [N_padded, hidden_dim] shuffled (may be padded)
+        - hidden_states_shuffled: [N_padded, hidden_dim] shuffled (or padded-only if indices_only)
         - shf_idx: [N_padded] shuffle permutation
         - inv_shf: [N_padded] inverse permutation for unshuffle
         - chunk_size: N_padded // num_devices (fixed per chunk)
@@ -218,13 +222,16 @@ def rebatch_for_layer(
 
     # Stable argsort groups tokens by predicted device, preserving relative order
     shf_idx = torch.argsort(dev_ids.long(), stable=True)
-    inv_shf = torch.argsort(shf_idx)
+    # O(N) inverse permutation via scatter (instead of O(N log N) argsort)
+    inv_shf = torch.empty_like(shf_idx)
+    inv_shf[shf_idx] = torch.arange(n_padded, device=device, dtype=shf_idx.dtype)
     chunk_size = n_padded // ctx.num_devices
 
-    # Shuffle hidden states
-    hidden_states_shuffled = hidden_states[shf_idx]
+    # Shuffle hidden states (skip when caller only needs indices, e.g. SRS path)
+    if not indices_only:
+        hidden_states = hidden_states[shf_idx]
 
-    return hidden_states_shuffled, shf_idx, inv_shf, chunk_size
+    return hidden_states, shf_idx, inv_shf, chunk_size
 
 
 def unshuffle_output(

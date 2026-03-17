@@ -112,7 +112,7 @@ class SemMoeSRSPool:
         """Get per-rank SAG output buffers as shaped tensors."""
         assert self.is_initialized
         srs_offset = self._srs_region_size
-        elem_size = torch.empty((), dtype=dtype).element_size()
+        elem_size = self._elem_size
         result = []
         for buf in self.bufs:
             storage = buf.untyped_storage()

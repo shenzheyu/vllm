@@ -75,6 +75,7 @@ class SemMoeModelContext:
     applied: bool = False
 
 
+@lru_cache(maxsize=1)
 def sem_moe_config() -> SemMoeConfig:
     enabled = _env_flag(SEM_MOE_ENV)
     raw_schedule_dir = os.getenv(SEM_MOE_TABLES_ENV)
@@ -124,6 +125,7 @@ def sem_moe_srs_enabled() -> bool:
 
 
 def clear_sem_moe_caches() -> None:
+    sem_moe_config.cache_clear()
     _load_schedule_cached.cache_clear()
 
 
@@ -497,6 +499,13 @@ def finalize_sem_moe_model(model: torch.nn.Module) -> None:
                     if type(mlp).__name__ in SUPPORTED_BLOCK_TYPES:
                         module._sem_moe_tp_ctx = tp_ctx  # type: ignore[attr-defined]
                         module._sem_moe_srs_active = srs_active  # type: ignore[attr-defined]
+                        # Pre-compute has_native_all2all to avoid getattr chain every forward
+                        experts = getattr(mlp, "experts", None)
+                        module._sem_moe_has_native_all2all = (  # type: ignore[attr-defined]
+                            experts is not None
+                            and hasattr(experts, "moe_parallel_config")
+                            and experts.moe_parallel_config.use_all2all_kernels
+                        )
                     elif srs_active:
                         # Non-MoE decoder layers: mark SRS active so they
                         # all_reduce their o_proj output in the standard path.

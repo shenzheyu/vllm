@@ -314,20 +314,22 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         if (
             self._sem_moe_tp_ctx is not None
             and not self._sem_moe_srs_active
-            and num_tokens >= 16
         ):
             from vllm.sem_moe_tp import _MIN_REBATCH_TOKENS, rebatch_for_layer
-            if num_tokens >= _MIN_REBATCH_TOKENS:
-                fwd_ctx = get_forward_context()
-                input_ids = fwd_ctx.additional_kwargs.get("sem_moe_input_ids")
-                if input_ids is not None and input_ids.shape[0] >= num_tokens:
-                    hidden_states, shf_idx, inv_shf, _ = rebatch_for_layer(
-                        self._sem_moe_tp_ctx,
-                        self.layer_idx,
-                        input_ids[:num_tokens],
-                        hidden_states,
-                    )
-                    num_tokens = hidden_states.shape[0]
+            fwd_ctx = get_forward_context()
+            input_ids = fwd_ctx.additional_kwargs.get("sem_moe_input_ids")
+            if (
+                num_tokens >= _MIN_REBATCH_TOKENS
+                and input_ids is not None
+                and input_ids.shape[0] >= num_tokens
+            ):
+                hidden_states, shf_idx, inv_shf, _ = rebatch_for_layer(
+                    self._sem_moe_tp_ctx,
+                    self.layer_idx,
+                    input_ids[:num_tokens],
+                    hidden_states,
+                )
+                num_tokens = hidden_states.shape[0]
 
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
@@ -1178,10 +1180,8 @@ class Qwen3NextDecoderLayer(nn.Module):
         run MoE normally (with all_reduce), then slice back to chunks.
         """
         from vllm.distributed import get_tp_group, tensor_model_parallel_all_reduce
-        from vllm.sem_moe_tp import rebatch_for_layer
+        from vllm.sem_moe_tp import _MIN_REBATCH_TOKENS, rebatch_for_layer
         from vllm.sem_moe_triton import sag_or_fallback, srs_or_fallback
-
-        _MIN_REBATCH_TOKENS = 16
         ctx = self._sem_moe_tp_ctx
         num_tokens = hidden_states.shape[0]
         tp_grp = get_tp_group()
@@ -1203,16 +1203,16 @@ class Qwen3NextDecoderLayer(nn.Module):
 
         moe_layer_idx = getattr(self.mlp, "layer_idx", None)
         _, shf_idx, inv_shf, chunk_size = rebatch_for_layer(
-            ctx, moe_layer_idx, input_ids[:num_tokens], hidden_states
+            ctx, moe_layer_idx, input_ids[:num_tokens], hidden_states,
+            indices_only=True,
         )
 
         n_padded = len(shf_idx)
 
         # Pad hidden_states and residual if needed
         if n_padded > num_tokens:
-            import torch.nn.functional as F
-            hidden_states = F.pad(hidden_states, (0, 0, 0, n_padded - num_tokens))
-            residual = F.pad(residual, (0, 0, 0, n_padded - num_tokens))
+            hidden_states = torch.nn.functional.pad(hidden_states, (0, 0, 0, n_padded - num_tokens))
+            residual = torch.nn.functional.pad(residual, (0, 0, 0, n_padded - num_tokens))
 
         pool = getattr(ctx, "srs_pool", None)
         # SRS: fused shuffle + reduce_scatter
@@ -1232,13 +1232,8 @@ class Qwen3NextDecoderLayer(nn.Module):
         )
 
         # MoE: check if fused_moe has native all2all dispatch/combine.
-        # If not, use allgather workaround so all ranks see all tokens.
-        experts = getattr(self.mlp, "experts", None)
-        has_native_all2all = (
-            experts is not None
-            and hasattr(experts, "moe_parallel_config")
-            and experts.moe_parallel_config.use_all2all_kernels
-        )
+        # Pre-computed at finalize time to avoid getattr chain every forward.
+        has_native_all2all = getattr(self, "_sem_moe_has_native_all2all", False)
         if has_native_all2all:
             # Full SRS: MoE processes chunk only (fused_moe handles dispatch)
             hidden_states = self.mlp(hidden_states)
