@@ -384,6 +384,41 @@ def bind_sem_moe_model_for_loading(model: torch.nn.Module, model_config: Any) ->
     )
 
 
+def _check_all2all_available(model: torch.nn.Module) -> bool:
+    """Check if any MoE block has all2all kernels available in fused_moe."""
+    for block in _iter_supported_sparse_moe_blocks(model):
+        experts = getattr(block, "experts", None)
+        if experts is not None and hasattr(experts, "moe_parallel_config"):
+            if experts.moe_parallel_config.use_all2all_kernels:
+                return True
+    return False
+
+
+def _revert_o_proj_reduce_results(model: torch.nn.Module) -> None:
+    """Revert full_attention o_proj.reduce_results back to True.
+
+    Called when SRS auto-degrades to debug_fallback because all2all
+    is not available. At construction time, sem_moe_srs_enabled()
+    returned True and set reduce_results=False on all full_attention
+    o_proj layers. We revert that here so the standard path works.
+    """
+    count = 0
+    for module in model.modules():
+        attn = getattr(module, "self_attn", None)
+        if attn is None:
+            continue
+        o_proj = getattr(attn, "o_proj", None)
+        if o_proj is None:
+            continue
+        if hasattr(o_proj, "reduce_results") and not o_proj.reduce_results:
+            o_proj.reduce_results = True
+            count += 1
+    if count > 0:
+        logger.info(
+            "Reverted o_proj.reduce_results to True on %d attention layers.", count
+        )
+
+
 def finalize_sem_moe_model(model: torch.nn.Module) -> None:
     context = getattr(model, "_sem_moe_context", None)
     if context is None or context.applied:
@@ -437,19 +472,35 @@ def finalize_sem_moe_model(model: torch.nn.Module) -> None:
         device = next(model.parameters()).device
         tp_ctx = build_tp_context(context.schedule, device)
         if tp_ctx is not None:
+            srs_active = not config.debug_fallback
+
+            if srs_active and not _check_all2all_available(model):
+                logger.info(
+                    "Sem-MoE SRS: fused_moe all2all not available; "
+                    "will use allgather workaround in _forward_srs."
+                )
+
             # Attach TP context to the model and all MoE blocks
             model._sem_moe_tp_ctx = tp_ctx  # type: ignore[attr-defined]
-            srs_active = not config.debug_fallback
             for block in _iter_supported_sparse_moe_blocks(model):
                 block._sem_moe_tp_ctx = tp_ctx  # type: ignore[attr-defined]
                 block._sem_moe_srs_active = srs_active  # type: ignore[attr-defined]
-            # Also mark decoder layers that contain MoE blocks,
-            # and inner model modules that thread input_ids in forward().
+            # Mark ALL decoder layers (not just MoE ones) so that
+            # full_attention non-MoE layers also get the o_proj all_reduce
+            # compensation when SRS is active.
             for module in model.modules():
                 mlp = getattr(module, "mlp", None)
-                if mlp is not None and type(mlp).__name__ in SUPPORTED_BLOCK_TYPES:
-                    module._sem_moe_tp_ctx = tp_ctx  # type: ignore[attr-defined]
-                    module._sem_moe_srs_active = srs_active  # type: ignore[attr-defined]
+                if mlp is not None:
+                    # Decoder layers with any type of MLP
+                    if not hasattr(module, "_sem_moe_srs_active"):
+                        module._sem_moe_srs_active = False
+                    if type(mlp).__name__ in SUPPORTED_BLOCK_TYPES:
+                        module._sem_moe_tp_ctx = tp_ctx  # type: ignore[attr-defined]
+                        module._sem_moe_srs_active = srs_active  # type: ignore[attr-defined]
+                    elif srs_active:
+                        # Non-MoE decoder layers: mark SRS active so they
+                        # all_reduce their o_proj output in the standard path.
+                        module._sem_moe_srs_active = srs_active  # type: ignore[attr-defined]
                 # Set on inner model instances (Qwen3NextModel, Qwen3MoeModel)
                 # that read _sem_moe_tp_ctx in forward() to thread input_ids.
                 if (

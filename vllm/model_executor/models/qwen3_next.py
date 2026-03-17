@@ -25,6 +25,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
@@ -1141,23 +1142,21 @@ class Qwen3NextDecoderLayer(nn.Module):
 
         # === Standard path ===
         # When SRS is active, full_attention o_proj has reduce_results=False.
-        # We must manually all_reduce for non-SRS full_attention layers.
-        # (linear_attention out_proj already has reduce_results=True.)
+        # Non-MoE full_attention layers and linear_attention layers that reach
+        # here need the all_reduce compensation.
         if self._sem_moe_srs_active and self.layer_type == "full_attention":
-            from vllm.distributed import tensor_model_parallel_all_reduce
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
 
-        # When SRS is active, MoE block skips its all_reduce. We must do it here
-        # for any layer that goes through the standard path (not _forward_srs).
+        # Linear_attention MoE layers: MoE block skips all_reduce when
+        # _sem_moe_srs_active=True. Compensate here.
         if (
             self._sem_moe_srs_active
+            and self.layer_type != "full_attention"
             and isinstance(self.mlp, Qwen3NextSparseMoeBlock)
-            and get_tensor_model_parallel_world_size() > 1
         ):
-            from vllm.distributed import tensor_model_parallel_all_reduce
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
         hidden_states = self._apply_ffn_layer_scale(hidden_states)
@@ -1169,7 +1168,15 @@ class Qwen3NextDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """SRS/SAG path for full_attention + MoE layers."""
+        """SRS/SAG path for full_attention + MoE layers.
+
+        Communication pattern:
+          SRS (reduce_scatter) → layernorm on chunk → MoE → SAG (allgather)
+
+        When fused_moe lacks native all2all (dp_size=1), we use an allgather
+        workaround: allgather chunks before MoE so all ranks see all tokens,
+        run MoE normally (with all_reduce), then slice back to chunks.
+        """
         from vllm.distributed import get_tp_group, tensor_model_parallel_all_reduce
         from vllm.sem_moe_tp import rebatch_for_layer
         from vllm.sem_moe_triton import sag_or_fallback, srs_or_fallback
@@ -1184,12 +1191,13 @@ class Qwen3NextDecoderLayer(nn.Module):
         fwd_ctx = get_forward_context()
         input_ids = fwd_ctx.additional_kwargs.get("sem_moe_input_ids")
         if input_ids is None or num_tokens < _MIN_REBATCH_TOKENS:
-            # Fallback to standard all_reduce
+            # Not enough tokens for rebatch; standard all_reduce fallback.
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual
             )
             hidden_states = self.mlp(hidden_states)
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
             hidden_states = self._apply_ffn_layer_scale(hidden_states)
             return hidden_states, residual
 
@@ -1198,33 +1206,6 @@ class Qwen3NextDecoderLayer(nn.Module):
             ctx, moe_layer_idx, input_ids[:num_tokens], hidden_states
         )
 
-        # Check if fused_moe has all2all for EP dispatch/combine.
-        # Without all2all, each rank only computes local experts' partial
-        # results. SRS gives each rank different tokens, making all_reduce
-        # impossible. Fall back to standard all_reduce path.
-        experts = getattr(self.mlp, "experts", None)
-        has_all2all = (
-            experts is not None
-            and hasattr(experts, "moe_parallel_config")
-            and experts.moe_parallel_config.use_all2all_kernels
-        )
-
-        if not has_all2all:
-            # Fallback: standard all_reduce + MoE (device_trace recorded above).
-            # o_proj has reduce_results=False, so we all_reduce attention output.
-            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual
-            )
-            hidden_states = self.mlp(hidden_states)
-            # MoE block skips all_reduce when _sem_moe_srs_active; do it here.
-            if num_ranks > 1:
-                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-            hidden_states = self._apply_ffn_layer_scale(hidden_states)
-            return hidden_states, residual
-
-        # === Full SRS/SAG path (requires all2all in fused_moe) ===
-        # rebatch_for_layer may pad hidden_states; n_padded >= num_tokens
         n_padded = len(shf_idx)
 
         # Pad hidden_states and residual if needed
@@ -1245,11 +1226,32 @@ class Qwen3NextDecoderLayer(nn.Module):
         offset = rank * chunk_size
         residual = residual_shuffled[offset : offset + chunk_size]
 
-        # Post-attention layernorm + MoE on chunk
+        # Post-attention layernorm on chunk
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual
         )
-        hidden_states = self.mlp(hidden_states)
+
+        # MoE: check if fused_moe has native all2all dispatch/combine.
+        # If not, use allgather workaround so all ranks see all tokens.
+        experts = getattr(self.mlp, "experts", None)
+        has_native_all2all = (
+            experts is not None
+            and hasattr(experts, "moe_parallel_config")
+            and experts.moe_parallel_config.use_all2all_kernels
+        )
+        if has_native_all2all:
+            # Full SRS: MoE processes chunk only (fused_moe handles dispatch)
+            hidden_states = self.mlp(hidden_states)
+        else:
+            # Allgather workaround: all ranks get all tokens for MoE
+            all_hidden = tp_grp.all_gather(hidden_states, dim=0)
+            all_hidden = self.mlp(all_hidden)
+            # MoE block skipped all_reduce (_sem_moe_srs_active=True),
+            # do it here to sum local expert partials across ranks
+            all_hidden = tensor_model_parallel_all_reduce(all_hidden)
+            # Slice back to this rank's chunk
+            hidden_states = all_hidden[rank * chunk_size : (rank + 1) * chunk_size]
+
         hidden_states = self._apply_ffn_layer_scale(hidden_states)
 
         # SAG: fused allgather + unshuffle
