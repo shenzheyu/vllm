@@ -38,8 +38,11 @@ from vllm.distributed import (
     get_ep_group,
     get_pp_group,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
 )
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
@@ -77,6 +80,9 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+# Minimum tokens to apply Sem-MoE TP rebatching
+_SEM_MOE_MIN_REBATCH_TOKENS = 16
 
 
 class Qwen3MoeMLP(nn.Module):
@@ -214,6 +220,12 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             is_sequence_parallel=self.is_sequence_parallel,
         )
 
+        self.layer_idx = extract_layer_index(prefix)
+        # Set by finalize_sem_moe_model when TP rebatching is enabled
+        self._sem_moe_tp_ctx = None
+        # When True, decoder layer handles SRS/SAG; MoE block skips rebatch + all_reduce
+        self._sem_moe_srs_active = False
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         assert hidden_states.dim() <= 2, (
             "Qwen3MoeSparseMoeBlock only supports 1D or 2D inputs"
@@ -221,6 +233,34 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         is_input_1d = hidden_states.dim() == 1
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+
+        # --- Sem-MoE TP: rebatch tokens before MoE (debug fallback only) ---
+        # When SRS is active, the decoder layer handles rebatch/unshuffle.
+        shf_idx = None
+        inv_shf = None
+        original_num_tokens = num_tokens
+        if (
+            self._sem_moe_tp_ctx is not None
+            and not self._sem_moe_srs_active
+            and num_tokens >= _SEM_MOE_MIN_REBATCH_TOKENS
+        ):
+            from vllm.sem_moe_tp import rebatch_for_layer
+            fwd_ctx = get_forward_context()
+            input_ids = fwd_ctx.additional_kwargs.get("sem_moe_input_ids")
+            if input_ids is not None and input_ids.shape[0] >= num_tokens:
+                hidden_states, shf_idx, inv_shf, chunk_size = rebatch_for_layer(
+                    self._sem_moe_tp_ctx,
+                    self.layer_idx,
+                    input_ids[:num_tokens],
+                    hidden_states,
+                )
+                if logger.isEnabledFor(10):  # DEBUG level
+                    logger.debug(
+                        "Sem-MoE TP rebatch layer=%d tokens=%d->%d chunk=%d",
+                        self.layer_idx, original_num_tokens,
+                        hidden_states.shape[0], chunk_size,
+                    )
+                num_tokens = hidden_states.shape[0]
 
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
@@ -234,7 +274,10 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             shared_out + fused_out if shared_out is not None else fused_out
         )
 
-        if self.is_sequence_parallel:
+        if self._sem_moe_srs_active:
+            # SRS mode: decoder layer handles SAG after us, skip all_reduce
+            pass
+        elif self.is_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
                 final_hidden_states, 0
             )
@@ -242,6 +285,13 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         elif self.tp_size > 1:
             final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(  # noqa E501
                 final_hidden_states
+            )
+
+        # --- Sem-MoE TP: unshuffle back to original order (debug fallback only) ---
+        if shf_idx is not None:
+            from vllm.sem_moe_tp import unshuffle_output
+            final_hidden_states = unshuffle_output(
+                final_hidden_states, inv_shf, original_num_tokens
             )
 
         # return to 1d if input is 1d
@@ -297,11 +347,14 @@ class Qwen3MoeAttention(nn.Module):
             prefix=f"{prefix}.qkv_proj",
         )
 
+        from vllm.sem_moe import sem_moe_srs_enabled
+
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results=not sem_moe_srs_enabled(),
             prefix=f"{prefix}.o_proj",
         )
 
@@ -403,6 +456,10 @@ class Qwen3MoeDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+        # Set by finalize_sem_moe_model when SRS/SAG is active
+        self._sem_moe_srs_active = False
+        self._sem_moe_tp_ctx = None
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -419,10 +476,135 @@ class Qwen3MoeDecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
         )
+        # When SRS is active, o_proj returns partial (un-reduced) output.
 
+        # === SRS path: shuffled reduce_scatter replaces all_reduce ===
+        if self._sem_moe_srs_active:
+            return self._forward_srs(hidden_states, residual)
+
+        # === Standard path (includes debug fallback where MoE block handles rebatch) ===
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
+        return hidden_states, residual
+
+    def _forward_srs(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """SRS/SAG path: reduce_scatter after attention, MoE on chunk, allgather after MoE.
+
+        Full SRS/SAG (with computation savings) requires fused_moe to use all2all
+        for EP dispatch/combine. When all2all is not available (e.g. DP=1 without
+        all2all backend), we fall back to standard all_reduce for the attention
+        output while still recording device_trace for rebatch statistics.
+        """
+        from vllm.sem_moe_tp import rebatch_for_layer
+
+        ctx = self._sem_moe_tp_ctx
+        num_tokens = hidden_states.shape[0]
+        tp_grp = get_tp_group()
+        rank = tp_grp.rank_in_group
+        num_ranks = tp_grp.world_size
+
+        # Compute rebatch indices + record device_trace
+        fwd_ctx = get_forward_context()
+        input_ids = fwd_ctx.additional_kwargs.get("sem_moe_input_ids")
+        moe_layer_idx = getattr(self.mlp, "layer_idx", None)
+        can_rebatch = (
+            input_ids is not None
+            and num_tokens >= _SEM_MOE_MIN_REBATCH_TOKENS
+            and moe_layer_idx is not None
+        )
+
+        shf_idx = None
+        if can_rebatch:
+            _, shf_idx, inv_shf, chunk_size = rebatch_for_layer(
+                ctx, moe_layer_idx, input_ids[:num_tokens], hidden_states
+            )
+
+        # Check if fused_moe has all2all available for EP dispatch/combine.
+        # Without all2all, each rank only computes local experts' partial
+        # results. SRS gives each rank different tokens, making all_reduce
+        # impossible. Fall back to standard all_reduce path.
+        experts = getattr(self.mlp, "experts", None)
+        has_all2all = (
+            experts is not None
+            and hasattr(experts, "moe_parallel_config")
+            and experts.moe_parallel_config.use_all2all_kernels
+        )
+
+        if not has_all2all or shf_idx is None:
+            if ctx.moe_layer_counter <= 1:  # only log for first layer
+                logger.warning(
+                    "Sem-MoE SRS fallback: has_all2all=%s, shf_idx=%s, "
+                    "num_tokens=%d, tp_size=%d, ep_size=%s",
+                    has_all2all, shf_idx is not None, num_tokens,
+                    num_ranks,
+                    getattr(experts.moe_parallel_config, "ep_size", "N/A")
+                    if experts is not None else "N/A",
+                )
+            # Fallback: standard all_reduce + MoE (no SRS computation savings,
+            # but device_trace is still recorded for LAR measurement).
+            # Note: o_proj has reduce_results=False when SRS is enabled, so we
+            # must manually all_reduce the attention output. Also, the MoE block
+            # has _sem_moe_srs_active=True so it skips its own all_reduce —
+            # we must do that manually too.
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
+            hidden_states = self.mlp(hidden_states)
+            # MoE block skipped all_reduce due to _sem_moe_srs_active;
+            # do it here since we're falling back to standard path
+            if num_ranks > 1:
+                hidden_states = self.mlp.experts.maybe_all_reduce_tensor_model_parallel(
+                    hidden_states
+                )
+            return hidden_states, residual
+
+        # === Full SRS/SAG path (requires all2all in fused_moe) ===
+        from vllm.sem_moe_triton import sag_or_fallback, srs_or_fallback
+
+        # Pad hidden_states and residual to match shf_idx length (N_padded)
+        n_padded = shf_idx.shape[0]
+        if hidden_states.shape[0] < n_padded:
+            pad_n = n_padded - hidden_states.shape[0]
+            hidden_states = torch.nn.functional.pad(hidden_states, (0, 0, 0, pad_n))
+            residual = torch.nn.functional.pad(residual, (0, 0, 0, pad_n))
+
+        # SRS: fused shuffle + reduce_scatter
+        pool = getattr(ctx, "srs_pool", None)
+        hidden_states = srs_or_fallback(
+            hidden_states, shf_idx, chunk_size,
+            pool=pool, rank=rank, num_ranks=num_ranks, tp_group=tp_grp,
+        )
+
+        # Residual: shuffle + slice to get this rank's chunk
+        residual_shuffled = residual[shf_idx]
+        offset = rank * chunk_size
+        residual = residual_shuffled[offset : offset + chunk_size]
+
+        # Post-attention layernorm on chunk
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual
+        )
+
+        # MoE on chunk (fused_moe uses all2all for EP dispatch/combine)
+        hidden_states = self.mlp(hidden_states)
+
+        # SAG: fused allgather + unshuffle
+        original_num_tokens = num_tokens
+        hidden_states = sag_or_fallback(
+            hidden_states, inv_shf, chunk_size, original_num_tokens,
+            pool=pool, rank=rank, num_ranks=num_ranks, tp_group=tp_grp,
+        )
+        residual = sag_or_fallback(
+            residual, inv_shf, chunk_size, original_num_tokens,
+            pool=pool, rank=rank, num_ranks=num_ranks, tp_group=tp_grp,
+        )
+
         return hidden_states, residual
 
 
@@ -484,6 +666,14 @@ class Qwen3MoeModel(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+
+        # Sem-MoE TP: thread input_ids and reset TP context
+        tp_ctx = getattr(self, "_sem_moe_tp_ctx", None)
+        if tp_ctx is not None and input_ids is not None:
+            tp_ctx.reset(hidden_states.shape[0], hidden_states.device)
+            get_forward_context().additional_kwargs[
+                "sem_moe_input_ids"
+            ] = input_ids
 
         aux_hidden_states = []
         for layer_idx, layer in enumerate(

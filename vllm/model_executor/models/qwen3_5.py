@@ -284,6 +284,10 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 ),
             )
 
+        # Set by finalize_sem_moe_model when SRS/SAG is active
+        self._sem_moe_srs_active = False
+        self._sem_moe_tp_ctx = None
+
 
 @support_torch_compile(
     dynamic_arg_dims={

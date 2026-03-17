@@ -41,6 +41,11 @@ class SemMoeLayerSchedule:
     gate_permutation: np.ndarray
     gate_inverse_permutation: np.ndarray
     score_full: np.ndarray
+    # TP tables (only loaded when mode in {"tp", "both"})
+    t_full: np.ndarray | None = None        # [vocab_size] int32
+    tp_full: np.ndarray | None = None       # [vocab_size] float32
+    a_table: np.ndarray | None = None       # [num_devices^lookback] int32
+    ap_table: np.ndarray | None = None      # [num_devices^lookback] float32
 
 
 @dataclass(frozen=True)
@@ -50,6 +55,7 @@ class SemMoeSchedule:
     layer_ids: tuple[int, ...]
     layers: dict[int, SemMoeLayerSchedule]
     dp_score_full: np.ndarray
+    lookback: int = 2
 
 
 @dataclass
@@ -101,6 +107,22 @@ def sem_moe_dp_enabled() -> bool:
     return config.enabled and config.mode in {"dp", "both"}
 
 
+def sem_moe_tp_enabled() -> bool:
+    config = sem_moe_config()
+    return config.enabled and config.mode in {"tp", "both"}
+
+
+def sem_moe_srs_enabled() -> bool:
+    """True when SRS/SAG kernels should replace standard all_reduce.
+
+    This is the full Milestone 3 path: o_proj skips reduce, decoder layer
+    handles SRS after attention + SAG after MoE.  When debug_fallback is on,
+    we keep standard all_reduce and only shuffle/unshuffle inside the MoE block.
+    """
+    config = sem_moe_config()
+    return config.enabled and config.mode in {"tp", "both"} and not config.debug_fallback
+
+
 def clear_sem_moe_caches() -> None:
     _load_schedule_cached.cache_clear()
 
@@ -134,6 +156,10 @@ def _load_schedule_cached(
         logger.warning("Invalid Sem-MoE manifest %s: missing %s.", manifest_path, exc)
         return None
 
+    lookback = int(manifest.get("lookback", 2))
+    mode = (os.getenv(SEM_MOE_MODE_ENV) or "both").strip().lower()
+    load_tp_tables = mode in {"tp", "both"}
+
     layers: dict[int, SemMoeLayerSchedule] = {}
     dp_score_full: np.ndarray | None = None
     for layer_id in layer_ids:
@@ -157,7 +183,27 @@ def _load_schedule_cached(
                     "gating_column_inverse_permutation",
                     expert_inverse_permutation,
                 )
+                # DEBUG: force identity permutation to isolate issue
+                if _env_flag("SEM_MOE_IDENTITY_PERM"):
+                    n = len(expert_permutation)
+                    expert_permutation = np.arange(n, dtype=np.int32)
+                    expert_inverse_permutation = np.arange(n, dtype=np.int32)
+                    gate_permutation = np.arange(n, dtype=np.int32)
+                    gate_inverse_permutation = np.arange(n, dtype=np.int32)
                 score_full = _load_layer_score_full(payload, num_devices, debug_fallback)
+                t_full = None
+                tp_full = None
+                a_table = None
+                ap_table = None
+                if load_tp_tables:
+                    if "T_full" in payload:
+                        t_full = payload["T_full"].astype(np.int32, copy=True)
+                    if "Tp_full" in payload:
+                        tp_full = payload["Tp_full"].astype(np.float32, copy=True)
+                    if "A" in payload:
+                        a_table = payload["A"].astype(np.int32, copy=True)
+                    if "Ap" in payload:
+                        ap_table = payload["Ap"].astype(np.float32, copy=True)
             except (KeyError, ValueError) as exc:
                 logger.warning("Invalid Sem-MoE layer artifact %s: %s", layer_path, exc)
                 return None
@@ -197,6 +243,10 @@ def _load_schedule_cached(
             gate_permutation=np.asarray(gate_permutation, dtype=np.int32),
             gate_inverse_permutation=np.asarray(gate_inverse_permutation, dtype=np.int32),
             score_full=score_full,
+            t_full=t_full,
+            tp_full=tp_full,
+            a_table=a_table,
+            ap_table=ap_table,
         )
 
     if dp_score_full is None:
@@ -209,6 +259,7 @@ def _load_schedule_cached(
         layer_ids=layer_ids,
         layers=layers,
         dp_score_full=dp_score_full,
+        lookback=lookback,
     )
 
 
@@ -339,11 +390,33 @@ def finalize_sem_moe_model(model: torch.nn.Module) -> None:
         return
 
     for bound_layer in context.bound_layers:
-        _permute_gate(bound_layer.gate, bound_layer.schedule.gate_permutation)
+        # Validate permutation arrays before applying
+        _validate_permutation(
+            bound_layer.schedule.gate_permutation,
+            bound_layer.schedule.num_experts,
+            f"layer {bound_layer.layer_id} gate_permutation",
+        )
+        _validate_permutation(
+            bound_layer.schedule.expert_permutation,
+            bound_layer.schedule.num_experts,
+            f"layer {bound_layer.layer_id} expert_permutation",
+        )
+        gp = bound_layer.schedule.gate_permutation
+        ep = bound_layer.schedule.expert_permutation
+        if not np.array_equal(gp, ep):
+            logger.warning(
+                "Sem-MoE layer %s: gate_permutation differs from expert_permutation! "
+                "This may cause incorrect routing. First 10 diffs: gate=%s expert=%s",
+                bound_layer.layer_id,
+                gp[:10].tolist(),
+                ep[:10].tolist(),
+            )
+        _permute_gate(bound_layer.gate, gp)
         bound_layer.experts.activate_sem_moe_runtime_map()
         local_old_experts = np.nonzero(bound_layer.loader_map.cpu().numpy() >= 0)[0].tolist()
         runtime_map = bound_layer.runtime_map.cpu().numpy()
         local_new_experts = np.nonzero(runtime_map >= 0)[0].tolist()
+
         logger.info(
             "Applied Sem-MoE placement to layer %s on EP rank %s/%s: "
             "checkpoint experts %s -> runtime experts %s.",
@@ -355,6 +428,69 @@ def finalize_sem_moe_model(model: torch.nn.Module) -> None:
         )
 
     context.applied = True
+
+    # --- TP rebatching setup ---
+    config = sem_moe_config()
+    if config.mode in {"tp", "both"}:
+        from vllm.sem_moe_tp import build_tp_context
+
+        device = next(model.parameters()).device
+        tp_ctx = build_tp_context(context.schedule, device)
+        if tp_ctx is not None:
+            # Attach TP context to the model and all MoE blocks
+            model._sem_moe_tp_ctx = tp_ctx  # type: ignore[attr-defined]
+            srs_active = not config.debug_fallback
+            for block in _iter_supported_sparse_moe_blocks(model):
+                block._sem_moe_tp_ctx = tp_ctx  # type: ignore[attr-defined]
+                block._sem_moe_srs_active = srs_active  # type: ignore[attr-defined]
+            # Also mark decoder layers that contain MoE blocks,
+            # and inner model modules that thread input_ids in forward().
+            for module in model.modules():
+                mlp = getattr(module, "mlp", None)
+                if mlp is not None and type(mlp).__name__ in SUPPORTED_BLOCK_TYPES:
+                    module._sem_moe_tp_ctx = tp_ctx  # type: ignore[attr-defined]
+                    module._sem_moe_srs_active = srs_active  # type: ignore[attr-defined]
+                # Set on inner model instances (Qwen3NextModel, Qwen3MoeModel)
+                # that read _sem_moe_tp_ctx in forward() to thread input_ids.
+                if (
+                    hasattr(module, "layers")
+                    and hasattr(module, "embed_tokens")
+                    and module is not model
+                ):
+                    module._sem_moe_tp_ctx = tp_ctx  # type: ignore[attr-defined]
+            logger.info(
+                "Sem-MoE TP rebatching enabled for %d MoE layers (srs=%s).",
+                len(tp_ctx.layer_tensors),
+                srs_active,
+            )
+
+            # Initialize SRS symmetric memory pool when SRS is active
+            if srs_active:
+                try:
+                    from vllm.distributed import get_tp_group
+                    from vllm.sem_moe_triton import SemMoeSRSPool
+
+                    tp_group = get_tp_group()
+                    srs_pool = SemMoeSRSPool()
+                    model_config = getattr(model, "config", None)
+                    hidden_size = getattr(model_config, "hidden_size", 2048)
+                    max_tokens = int(os.getenv("SEM_MOE_SRS_MAX_TOKENS", "8192"))
+                    srs_pool.initialize(
+                        max_tokens=max_tokens,
+                        hidden_dim=hidden_size,
+                        dtype=next(model.parameters()).dtype,
+                        num_ranks=tp_group.world_size,
+                        group=tp_group.device_group,
+                        device=device,
+                    )
+                    tp_ctx.srs_pool = srs_pool  # type: ignore[attr-defined]
+                except Exception:
+                    logger.warning(
+                        "Failed to initialize SRS symmetric memory pool; "
+                        "falling back to NCCL for SRS/SAG.",
+                        exc_info=True,
+                    )
+                    tp_ctx.srs_pool = None  # type: ignore[attr-defined]
 
 
 class SemMoeDPSelector:
@@ -412,6 +548,20 @@ def pick_dp_rank_for_request(
     if not bool(dev_mask.any()):
         dev_mask[:] = True
     return device_id
+
+
+def _validate_permutation(perm: np.ndarray, expected_size: int, name: str) -> None:
+    if perm.shape != (expected_size,):
+        raise ValueError(
+            f"Sem-MoE {name}: expected shape ({expected_size},), got {perm.shape}."
+        )
+    sorted_perm = np.sort(perm)
+    expected = np.arange(expected_size, dtype=sorted_perm.dtype)
+    if not np.array_equal(sorted_perm, expected):
+        raise ValueError(
+            f"Sem-MoE {name}: not a valid permutation of [0..{expected_size-1}]. "
+            f"min={perm.min()}, max={perm.max()}, unique={len(np.unique(perm))}."
+        )
 
 
 def _iter_supported_sparse_moe_blocks(model: torch.nn.Module):
